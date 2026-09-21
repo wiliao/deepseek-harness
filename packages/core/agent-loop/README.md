@@ -122,7 +122,7 @@ Prompt admission uses the actual `prepareCall()` result, not the preceding `requ
 
 ### Failure and cancellation
 
-Final adapter selection, dispatch, and iteration failures arrive as terminal finishes and enter `agent/request-error`; a handling listener returns `{ kind: 'retry' }` without calling `next()`, while an unhandled failure is terminal. Middleware, result-processing, tool, and other extension failures remain thrown and close the turn directly — plugin failure ends the turn, not the loop. Undispatched model tool calls after cancellation receive synthetic `tool/call` plus `ABORTED_BEFORE_DISPATCH` result pairs. The [explicit-cancellation decision](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.md) owns the signal lifecycle.
+Final adapter selection, dispatch, and iteration failures arrive as terminal finishes and enter `agent/request-error`; a handling listener returns `{ kind: 'retry' }` without calling `next()`, while an unhandled failure is terminal. Middleware, result-processing, tool, and other extension failures remain thrown and close the turn directly — plugin failure ends the turn, not the loop. Undispatched model tool calls after cancellation receive synthetic `tool/call` plus `ABORTED_BEFORE_DISPATCH` result pairs, and a terminal scheduler failure likewise answers every call the assistant message named — the group that failed, and later groups it never reached — with `TOOL_SCHEDULER_FAILED` (a call that may have run) or `TOOL_SCHEDULER_FAILED_BEFORE_DISPATCH` (one that never started). Leaving a recorded call unmatched would make the whole durable log unserializable, so one scheduler fault would otherwise break every later turn in that session. The [explicit-cancellation decision](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.md) owns the signal lifecycle.
 
 </details>
 
@@ -138,6 +138,7 @@ The package-level contract is enough for most consumers; read these when you nee
 - [Session subsystem](../../../docs/subsystems/session.md) — the durable log the loop writes and derives from.
 - [Tools subsystem](../../../docs/subsystems/tools.md) — the pipeline the loop dispatches through.
 - [Explicit-cancellation Agent Note](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.md) — signal lifetime and cancellation races.
+- [Scheduler-failure results Agent Note](../../../.agents/notes/implemented/bug-fix/2026-09-21-scheduler-failure-tool-results.md) — why a failed scheduler still pairs every recorded call.
 - [Core group map](../README.md) — how the core packages compose.
 
 -----
@@ -177,7 +178,7 @@ Ordinary history growth is append-only and preserves reusable entries. A surface
 
 #### What the model sees
 
-If a later request replays an aborted step, each tool call that cancellation prevented from dispatching has error code `ABORTED_BEFORE_DISPATCH` and result text `Error: tool call aborted before dispatch`.
+If a later request replays an aborted step, each tool call that cancellation prevented from dispatching has error code `ABORTED_BEFORE_DISPATCH` and result text `Error: tool call aborted before dispatch`. A step whose scheduler failed replays with one error result per recorded call, so the transcript stays valid for later requests.
 
 #### Token effect
 

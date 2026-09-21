@@ -6,16 +6,29 @@
  * and drains started calls.
  *
  * Abort records synthetic error results for skipped calls so replay stays
- * valid. A terminal scheduler failure preserves already-recorded `tool/call`
- * events without fabricating results.
+ * valid. A terminal scheduler failure closes every call it leaves behind the
+ * same way: a recorded `tool/call` whose result never arrives makes the whole
+ * log unserializable, so one fault would otherwise poison the session.
  * @module dsh-agent-loop/tool-calls
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { createToolResultMessage, type ToolCallBlock } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, errorChain, type ToolCallBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionSeq, UserMessage } from '@deepseek-ai/dsh-session'
-import { TOOL_ABORTED_BEFORE_DISPATCH, TOOL_RUNTIME_SCHEDULER, type ToolExecutionInput, type ToolExecutionMode, type ToolExecutionResult, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { TOOL_ABORTED_BEFORE_DISPATCH, TOOL_RUNTIME_SCHEDULER, type ScheduledToolPreparation, type ToolExecutionInput, type ToolExecutionMode, type ToolExecutionResult, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
+
+/**
+ * Error code on the result of a recorded call whose scheduler produced no
+ * outcome. The call may have reached its body, so its outcome is unknown.
+ */
+const TOOL_SCHEDULER_FAILED = 'TOOL_SCHEDULER_FAILED'
+
+/** Error code on the result of a model call a scheduler failure left unstarted. */
+const TOOL_SCHEDULER_FAILED_BEFORE_DISPATCH = 'TOOL_SCHEDULER_FAILED_BEFORE_DISPATCH'
+
+/** Error name shared by both scheduler-failure results. */
+const TOOL_SCHEDULER_ERROR = 'ToolSchedulerError'
 
 /** One tool call after argument parsing, ready to schedule. */
 interface PlannedCall {
@@ -83,16 +96,26 @@ export async function executeToolCalls(
   let next = 0
   let concluded = false
   while (next < planned.length) {
-    // Commit before classifying again so registry changes affect unstarted calls.
-    // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
-    const first = planned[next]!
-    const mode = ctx.tools.executionMode(first.exec).kind
-    const group = mode === 'parallel' ? planned.slice(next) : [first]
-    const outcome = await runGroup(
-      ctx, turn, step, group, mode, signal, acceptContext,
-    )
-    next += outcome.consumed
-    concluded ||= outcome.concluded
+    let group: PlannedCall[] = []
+    let outcome: GroupOutcome
+    try {
+      // Commit before classifying again so registry changes affect unstarted calls.
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
+      const first = planned[next]!
+      const mode = ctx.tools.executionMode(first.exec).kind
+      group = mode === 'parallel' ? planned.slice(next) : [first]
+      outcome = await runGroup(
+        ctx, turn, step, group, mode, signal, acceptContext,
+      )
+      next += outcome.consumed
+      concluded ||= outcome.concluded
+    } catch (error: unknown) {
+      // The failing group closed its own calls; a failure before any group ran
+      // leaves `group` empty. Either way the assistant message already names
+      // every remaining call, so each still needs a paired result.
+      finishUnreachedCalls(session, turn, step, planned.slice(next + group.length), error)
+      throw error
+    }
     if (outcome.aborted) {
       for (const call of planned.slice(next)) appendSkippedToolCall(session, turn, step, call.block)
       return { concluded }
@@ -160,6 +183,25 @@ async function runGroup(
     }
   }
 
+  // A drained dispatch may still hold a real outcome, so close-out commits
+  // whatever already settled and only then synthesizes results for the rest.
+  // The durable log pairs every `tool/call` with exactly one result.
+  const closeGroup = async (cause: unknown): Promise<void> => {
+    try {
+      await commitReady()
+    } catch (_commitFailure) {
+      // Finalization is scheduler-owned work that has already failed; the
+      // synthesized results below report this group's failure instead.
+    }
+    for (let index = committed; index < group.length; index++) {
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded index
+      const block = group[index]!.block
+      const callSeq = callSeqs[index]
+      if (callSeq === undefined) appendUnstartedSchedulerToolCall(session, turn, step, block, cause)
+      else appendSchedulerToolCallResult(session, turn, step, block, callSeq, cause)
+    }
+  }
+
   const inFlight = new Map<number, Promise<number>>()
 
   const startCall = async (index: number): Promise<void> => {
@@ -167,7 +209,15 @@ async function runGroup(
     const call = group[index]!
     callSeqs[index] = appendToolCall(session, turn, step, call.block)
     started++
-    const prepared = await ctx.tools[TOOL_RUNTIME_SCHEDULER].prepare(call.exec)
+    let prepared: ScheduledToolPreparation
+    try {
+      prepared = await ctx.tools[TOOL_RUNTIME_SCHEDULER].prepare(call.exec)
+    } catch (error: unknown) {
+      // The call is durable now, so it must reach a result even though the
+      // scheduler cannot describe what ran. The group's close-out writes it.
+      schedulerFailure ??= { error }
+      throw schedulerFailure.error
+    }
     throwSchedulerFailure()
     switch (prepared.kind) {
       case 'dispatch': {
@@ -232,6 +282,7 @@ async function runGroup(
   } catch (error: unknown) {
     schedulerFailure ??= { error }
     await Promise.allSettled(inFlight.values())
+    await closeGroup(schedulerFailure.error)
     throw schedulerFailure.error
   }
 
@@ -244,6 +295,53 @@ async function runGroup(
   /* v8 ignore next -- unreachable: a non-aborted group commits every started call */
   if (committed !== started) throw new Error('tool-call scheduler: uncommitted settled calls')
   return { consumed: started, aborted: false, concluded }
+}
+
+/** Model-facing detail for a scheduler failure, including its cause chain. */
+function schedulerFailureDetail(cause: unknown): string {
+  return `tool call failed: ${errorChain(cause)}`
+}
+
+/** Append the durable call/result pair for a model call the scheduler never opened. */
+function appendUnstartedSchedulerToolCall(
+  session: Session, turn: number, step: number, block: ToolCallBlock, cause: unknown,
+): void {
+  const detail = schedulerFailureDetail(cause)
+  const callSeq = appendToolCall(session, turn, step, block)
+  appendToolResult(session, turn, step, block, {
+    content: [{ type: 'text', text: `Error: ${detail}` }],
+    isError: true,
+    error: {
+      message: detail,
+      info: { name: TOOL_SCHEDULER_ERROR, code: TOOL_SCHEDULER_FAILED_BEFORE_DISPATCH },
+    },
+  }, callSeq)
+}
+
+/** Append an error result for a recorded call whose scheduler produced no outcome. */
+function appendSchedulerToolCallResult(
+  session: Session, turn: number, step: number, block: ToolCallBlock, callSeq: SessionSeq, cause: unknown,
+): void {
+  const detail = schedulerFailureDetail(cause)
+  appendToolResult(session, turn, step, block, {
+    content: [{ type: 'text', text: `Error: ${detail}` }],
+    isError: true,
+    error: {
+      message: detail,
+      info: { name: TOOL_SCHEDULER_ERROR, code: TOOL_SCHEDULER_FAILED },
+    },
+  }, callSeq)
+}
+
+/**
+ * Close model calls that a scheduler failure left without any executed group,
+ * such as the calls of groups after the one that failed. Their assistant
+ * message is already durable, so each call still needs a paired result.
+ */
+function finishUnreachedCalls(
+  session: Session, turn: number, step: number, calls: readonly PlannedCall[], cause: unknown,
+): void {
+  for (const call of calls) appendUnstartedSchedulerToolCall(session, turn, step, call.block, cause)
 }
 
 /** Append the durable call/result pair for a model call skipped after cancellation. */

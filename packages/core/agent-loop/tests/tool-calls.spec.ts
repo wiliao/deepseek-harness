@@ -5,7 +5,8 @@
 
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { createUserMessage, ToolCallId, StreamChunk  } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ToolCallId, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
@@ -702,6 +703,167 @@ describe('tool-call scheduler: failure quiescence', () => {
     expect(events(agent).findLast(event => event.type === 'turn/end')).toMatchObject({
       data: { reason: { kind: 'error', error: { message: schedulerError.message, code: 'UNKNOWN' } } },
     })
+  })
+})
+
+describe('tool-call scheduler: recorded calls always receive a result', () => {
+  /** Pair every recorded `tool/call` with the `tool/result` that answers it. */
+  const pairing = (agent: Agent): { calls: string[]; results: string[] } => {
+    const calls = events(agent).flatMap(event => event.type === 'tool/call' ? [String(event.data.callId)] : [])
+    const results = events(agent).flatMap(event => event.type === 'tool/result'
+      ? [String(event.data.message.source.callId)]
+      : [])
+    const assistantCalls = events(agent).flatMap(event => event.type === 'assistant/message'
+      ? event.data.message.content.flatMap(block => block.type === 'tool-call' ? [String(block.id)] : [])
+      : [])
+    return { calls: [...new Set([...assistantCalls, ...calls])], results }
+  }
+
+  /**
+   * Reproduce the DeepSeek Messages rule that rejects a request when an
+   * assistant turn's `tool_use` ids are not all resolved by the user turn that
+   * follows it. A log this returns false for would fail every later request,
+   * not just the failed one, which is the corruption Fix C prevents.
+   */
+  const replaysAsValidToolHistory = (agent: Agent): boolean => {
+    // Adjacent same-role messages merge onto one wire turn before the check,
+    // so parallel results from separate `tool/result` events share a turn.
+    const turns: { role: string; content: ContentBlock[] }[] = []
+    for (const message of agent.session.deriveMessages()) {
+      const previous = turns.at(-1)
+      if (previous?.role === message.role) previous.content.push(...message.content)
+      else turns.push({ role: message.role, content: [...message.content] })
+    }
+    let pending = new Set<string>()
+    for (const turn of turns) {
+      if (turn.role === 'assistant') {
+        pending = new Set(turn.content.flatMap(block => block.type === 'tool-call' ? [String(block.id)] : []))
+      } else if (turn.role === 'user') {
+        for (const block of turn.content) {
+          if (block.type === 'tool-result') pending.delete(String(block.toolCallId))
+        }
+        if (pending.size > 0) return false
+      }
+    }
+    return pending.size === 0
+  }
+
+  it('gives every model call a result when the scheduler fails during ordered pre-execute', async () => {
+    const adapter = new MockAdapter([
+      multiCall([
+        { id: 'c1', name: 'p', args: { id: '1' } },
+        { id: 'c2', name: 'p', args: { id: '2' } },
+      ]),
+    ])
+    const ctx = await harness(adapter, 2)
+    const gated = gatedParallelTool('p')
+    ctx.tools.register(gated.tool)
+    const scheduler = ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    const prepare = scheduler.prepare.bind(scheduler)
+    const schedulerError = new Error('prepare exploded')
+    scheduler.prepare = async (exec) => {
+      if (exec.callId === ToolCallId('c2')) throw schedulerError
+      return await prepare(exec)
+    }
+    const agent = await ctx.agentLoop.create(SessionId('scheduler-prepare-failure'), { provider: 'mock', model: 'mock' })
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await until(() => gated.started.includes('1'))
+    gated.release('1')
+    await waitForIdle(ctx, agent)
+
+    // The failure still reaches the turn boundary with its own message.
+    expect(events(agent).findLast(event => event.type === 'turn/end')).toMatchObject({
+      data: { reason: { kind: 'error', error: { message: schedulerError.message, code: 'UNKNOWN' } } },
+    })
+
+    // Every call the assistant message named is answered exactly once, and no
+    // result names a call the log never recorded.
+    const { calls, results } = pairing(agent)
+    expect(calls).toEqual(['c1', 'c2'])
+    expect([...results].sort()).toEqual(['c1', 'c2'])
+    expect(results).toHaveLength(new Set(results).size)
+
+    // The repaired history stays a valid Messages transcript, so later turns
+    // can still build a request from it instead of failing before dispatch.
+    expect(replaysAsValidToolHistory(agent)).toBe(true)
+    expect(agent.session.deriveMessages().flatMap(message => message.role === 'user'
+      ? message.content.flatMap(block => block.type === 'tool-result' ? [String(block.toolCallId)] : [])
+      : [])).toEqual(['c1', 'c2'])
+  })
+
+  it('answers calls in later groups that the failure never reached', async () => {
+    const adapter = new MockAdapter([
+      multiCall([
+        { id: 'c1', name: 'x', args: { id: '1' } },
+        { id: 'c2', name: 'p', args: { id: '2' } },
+        { id: 'c3', name: 'p', args: { id: '3' } },
+        { id: 'c4', name: 'x', args: { id: '4' } },
+      ]),
+      textResponse('never reached'),
+    ])
+    const ctx = await harness(adapter, 2)
+    const gated = gatedParallelTool('p')
+    const exclusive: string[] = []
+    ctx.tools.register(gated.tool)
+    ctx.tools.register(defineContentToolFixture({
+      name: 'x',
+      description: 'exclusive',
+      parameters: { id: { type: 'string', required: true } },
+      async execute(args) { exclusive.push(args.id); return [{ type: 'text', text: 'x' }] },
+    }))
+    const scheduler = ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    const dispatch = scheduler.dispatch.bind(scheduler)
+    const schedulerError = new Error('leading exclusive dispatch exploded')
+    scheduler.dispatch = exec => exec.callId === ToolCallId('c1')
+      ? Promise.reject(schedulerError)
+      : dispatch(exec)
+    const agent = await ctx.agentLoop.create(SessionId('scheduler-later-groups'), { provider: 'mock', model: 'mock' })
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    // The exclusive barrier failed alone; the parallel calls and the trailing
+    // barrier formed later groups the scheduler never reached.
+    expect(exclusive).toEqual([])
+    const { calls, results } = pairing(agent)
+    expect(calls).toEqual(['c1', 'c2', 'c3', 'c4'])
+    expect([...results].sort()).toEqual(['c1', 'c2', 'c3', 'c4'])
+    expect(replaysAsValidToolHistory(agent)).toBe(true)
+  })
+
+  it('keeps the group outcome atomic when only some calls started', async () => {
+    const adapter = new MockAdapter([
+      multiCall([
+        { id: 'c1', name: 'p', args: { id: '1' } },
+        { id: 'c2', name: 'p', args: { id: '2' } },
+      ]),
+    ])
+    // The cap holds `c2` unstarted, so the failing pool must answer both a
+    // call it already recorded and one it never opened.
+    const ctx = await harness(adapter, 1)
+    const gated = gatedParallelTool('p')
+    ctx.tools.register(gated.tool)
+    const scheduler = ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    const dispatch = scheduler.dispatch.bind(scheduler)
+    const schedulerError = new Error('first dispatch exploded')
+    scheduler.dispatch = exec => exec.callId === ToolCallId('c1')
+      ? Promise.reject(schedulerError)
+      : dispatch(exec)
+    const agent = await ctx.agentLoop.create(SessionId('scheduler-partial-group'), { provider: 'mock', model: 'mock' })
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    // The unstarted sibling never ran, and the failing call never committed a
+    // real outcome, yet both are answered so the step replays.
+    expect(gated.started).toEqual([])
+    const { calls, results } = pairing(agent)
+    expect(calls).toEqual(['c1', 'c2'])
+    expect([...results].sort()).toEqual(['c1', 'c2'])
+    expect(events(agent).filter(event => event.type === 'tool/result').map(event =>
+      event.data.error?.code)).toEqual(['TOOL_SCHEDULER_FAILED', 'TOOL_SCHEDULER_FAILED_BEFORE_DISPATCH'])
+    expect(replaysAsValidToolHistory(agent)).toBe(true)
   })
 })
 

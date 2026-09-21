@@ -122,7 +122,7 @@ const handle = await ctx.agents.create({
 
 ### 失败与取消
 
-最终适配器选择、分发与迭代失败以终止结束的形式到达并进入 `agent/request-error`；处理该失败的监听器返回 `{ kind: 'retry' }` 且不调用 `next()`，未被处理的失败则是终态。Middleware、结果处理、工具及其他扩展失败仍会抛出并直接关闭轮次——插件失败结束的是轮次，不是循环。取消后未分发的模型工具调用会收到合成的 `tool/call` 加 `ABORTED_BEFORE_DISPATCH` 结果对。[显式取消决策](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.zh.md)拥有信号生命周期。
+最终适配器选择、分发与迭代失败以终止结束的形式到达并进入 `agent/request-error`；处理该失败的监听器返回 `{ kind: 'retry' }` 且不调用 `next()`，未被处理的失败则是终态。Middleware、结果处理、工具及其他扩展失败仍会抛出并直接关闭轮次——插件失败结束的是轮次，不是循环。取消后未分发的模型工具调用会收到合成的 `tool/call` 加 `ABORTED_BEFORE_DISPATCH` 结果对；终止性调度器失败同样会为 assistant 消息中出现的每个调用补上结果——既包括失败的组，也包括它未能到达的后续组——错误码为 `TOOL_SCHEDULER_FAILED`（该调用可能已执行）或 `TOOL_SCHEDULER_FAILED_BEFORE_DISPATCH`（该调用从未启动）。[显式取消决策](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.zh.md)拥有信号生命周期。
 
 </details>
 
@@ -138,6 +138,7 @@ const handle = await ctx.agents.create({
 - [会话子系统](../../../docs/subsystems/session.zh.md)——循环写入并据此派生的持久日志。
 - [工具子系统](../../../docs/subsystems/tools.zh.md)——循环分发所经过的流水线。
 - [显式取消 Agent Note](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.zh.md)——信号生命周期与取消竞态。
+- [调度器失败结果 Agent Note](../../../.agents/notes/implemented/bug-fix/2026-09-21-scheduler-failure-tool-results.zh.md) — 为什么调度器失败后仍会为每个已记录的调用配对结果。
 - [core 分组地图](../README.zh.md)——core 各包如何组合。
 
 -----
@@ -177,7 +178,7 @@ const handle = await ctx.agents.create({
 
 #### 模型看到什么
 
-如果后续请求回放一个中止的步骤，取消所阻止分发的每个工具调用都有错误码 `ABORTED_BEFORE_DISPATCH`，结果文本为 `Error: tool call aborted before dispatch`。
+如果后续请求回放一个中止的步骤，取消所阻止分发的每个工具调用都有错误码 `ABORTED_BEFORE_DISPATCH`，结果文本为 `Error: tool call aborted before dispatch`。调度器失败的步骤回放时，每个已记录的调用都有一个错误结果，因此该 transcript 对后续请求仍然有效。
 
 #### Token 影响
 
