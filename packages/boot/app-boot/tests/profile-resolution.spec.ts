@@ -10,12 +10,12 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { createRequire } from 'node:module'
+import { createRequire, register } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { getEnvironmentData } from 'node:worker_threads'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
   installProfileResolution,
   registerWorkerResolution,
@@ -1513,5 +1513,133 @@ describe('profile resolution generation', { concurrent: false }, () => {
     expect(require.resolve('resolution-lib')).toBe(join(f.installed, 'index.cjs'))
     registration.dispose()
     expect(() => { require.resolve('resolution-lib') }).toThrow(/Cannot find module/u)
+  })
+})
+
+describe('profile resolution: one module instance per workspace package', () => {
+  /**
+   * A fixture standing in for a source launch: a loader hook maps one bare
+   * package specifier to the package's `src` entry, exactly as tsconfig `paths`
+   * does under `node --import tsx/esm`. The hook is registered once and cannot
+   * be removed, so it owns a name no other case uses and reads its target from a
+   * file — a loader hook runs on its own thread and cannot see this process's
+   * globals.
+   */
+  const hookName = 'source-plane-fixture'
+  // Outside the temp roots an `afterEach` clears: the hook outlives this file.
+  const hookTarget = join(mkdtempSync(join(tmpdir(), 'dsh-source-plane-')), 'target.txt')
+
+  // Mirrors the observed tsconfig `paths` behaviour: the mapping applies to
+  // importers outside `node_modules` (workspace source and the profile
+  // directory). A declarer inside the installed `node_modules` chain still
+  // resolves the package's published entry, which is why routing through the
+  // declarer used to select the built `lib` entry instead of `src`.
+  const hookUrl = `data:text/javascript,${encodeURIComponent(`
+    import { readFileSync } from 'node:fs'
+    export async function resolve(specifier, context, next) {
+      if (specifier === ${JSON.stringify(hookName)}
+        && !(context.parentURL ?? '').includes('/node_modules/')) {
+        const entry = readFileSync(${JSON.stringify(hookTarget)}, 'utf8').trim()
+        return { url: entry, shortCircuit: true }
+      }
+      return next(specifier, context)
+    }
+  `)}`
+
+  beforeAll(() => { register(hookUrl) })
+
+  const setHookTarget = (url: string): void => {
+    writeFileSync(hookTarget, `${url}\n`)
+  }
+
+  /** One installation whose declarer sits inside `node_modules`, as production does. */
+  const sourcePlaneFixture = (): { fixture: ReturnType<typeof fixture>; builtEntry: string; sourceEntry: string } => {
+    const f = fixture(hookName)
+    const installDir = join(f.root, 'install')
+    // Move the installation into a node_modules chain so the declarer manifest
+    // is inside it: that is what suppresses the source mapping for the declarer.
+    const chained = join(installDir, 'node_modules', 'source-plane-app')
+    const chainedAnchor = pkg(chained, 'source-plane-app', 0, { [hookName]: '*' })
+    rmSync(f.installed, { recursive: true })
+    const installed = join(chained, 'node_modules', hookName)
+    pkg(installed, hookName, 1)
+    const builtEntry = join(installed, 'built-entry.js')
+    const sourceEntry = join(installed, 'src-entry.js')
+    file(builtEntry, 'export const marker = \'built\'\n')
+    file(sourceEntry, 'export const marker = \'source\'\n')
+    file(join(installed, 'package.json'), JSON.stringify({
+      name: hookName,
+      version: '1.0.0',
+      type: 'module',
+      // `main`/`exports` name the built entry, as a published manifest does.
+      main: './built-entry.js',
+      exports: { '.': './built-entry.js' },
+    }))
+    return { fixture: { ...f, installAnchor: chainedAnchor, installed }, builtEntry, sourceEntry }
+  }
+
+  it("prefers the importer's own entry for a fallback package instead of the declarer's build", async () => {
+    const { fixture: f, sourceEntry } = sourcePlaneFixture()
+    setHookTarget(pathToFileURL(sourceEntry).href)
+
+    const registration = installProfileResolution(await generationOf(f))
+    registrations.push(registration)
+    const parent = pathToFileURL(join(f.profile.dir, 'entry.mjs')).href
+
+    // The profile-scoped importer's own lookup order wins, so every import site
+    // agrees on one instance of the package instead of loading `src` and `lib`.
+    expect(resolveFrom(hookName, parent)).toBe(pathToFileURL(sourceEntry).href)
+    // A non-empty attribute set bypasses the per-request cache on both routes.
+    expect(resolveFrom(hookName, parent, { type: 'javascript' })).toBe(pathToFileURL(sourceEntry).href)
+    expect(await importFrom(hookName, parent)).toMatchObject({ marker: 'source' })
+    // The declarer's own lookup order still selects the published entry; that
+    // disagreement is exactly the dual-instance load this rule removes.
+    expect(resolveFrom(hookName, pathToFileURL(f.installAnchor).href))
+      .toBe(pathToFileURL(join(f.installed, 'built-entry.js')).href)
+  })
+
+  it('keeps the generation route when the importer cannot reach the package itself', async () => {
+    const { fixture: f, builtEntry } = sourcePlaneFixture()
+    // The mapping names a file outside the selected package, so the importer's
+    // own lookup order does not agree on the package and is not used.
+    setHookTarget(pathToFileURL(join(f.root, 'absent-entry.js')).href)
+
+    const registration = installProfileResolution(await generationOf(f))
+    registrations.push(registration)
+    const parent = pathToFileURL(join(f.profile.dir, 'entry.mjs')).href
+
+    expect(resolveFrom(hookName, parent)).toBe(pathToFileURL(builtEntry).href)
+    // A non-empty attribute set bypasses the per-request cache.
+    expect(resolveFrom(hookName, parent, { type: 'javascript' })).toBe(pathToFileURL(builtEntry).href)
+  })
+
+  it('accepts the generation route in dual mode when the importer reaches the same file', async () => {
+    const { fixture: f, builtEntry } = sourcePlaneFixture()
+    // The hook maps the specifier back to the package's published entry, so the
+    // disk and generation backends agree and dual mode accepts the result.
+    setHookTarget(pathToFileURL(builtEntry).href)
+
+    const registration = installProfileResolution(await generationOf(f), 'verify')
+    registrations.push(registration)
+    const parent = pathToFileURL(join(f.profile.dir, 'entry.mjs')).href
+
+    expect(resolveFrom(hookName, parent)).toBe(pathToFileURL(builtEntry).href)
+    expect(resolveFrom(hookName, parent, { type: 'javascript' })).toBe(pathToFileURL(builtEntry).href)
+  })
+
+  it('leaves dual-mode verification to disk-versus-generation comparison', async () => {
+    const { fixture: f } = sourcePlaneFixture()
+    // Dual mode compares the two backends; the importer's own entry is not a
+    // package-selection input there, so this hook only changes the disk side and
+    // the disagreement is reported as a mismatch.
+    const outsider = join(f.root, 'outsider.js')
+    file(outsider, 'export const marker = \'outsider\'\n')
+    setHookTarget(pathToFileURL(outsider).href)
+
+    const registration = installProfileResolution(await generationOf(f), 'verify')
+    registrations.push(registration)
+    const parent = pathToFileURL(join(f.profile.dir, 'entry.mjs')).href
+
+    expect(() => resolveFrom(hookName, parent)).toThrow(/profile resolution mismatch/u)
   })
 })

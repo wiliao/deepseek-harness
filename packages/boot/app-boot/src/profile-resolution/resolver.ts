@@ -161,6 +161,48 @@ function startsWithin(path: string, roots: readonly string[]): boolean {
   return false
 }
 
+/**
+ * Resolve `request` through the importer's own lookup order, but only when that
+ * order selects a file inside `packageDir`, the directory a fallback route chose.
+ *
+ * A fallback route names the package the generation selected, not the entry
+ * inside it, and the importer's own chain can reach that package by a different
+ * entry: a source launch maps workspace packages to their `src` entry through the
+ * active loader hooks, while re-resolving from the declarer's manifest selects
+ * the published `lib` entry. Both name one package, and two live copies of a
+ * package that owns a service definition or an exported symbol do not
+ * interoperate, so the importer's resolution wins whenever the directory agrees.
+ *
+ * The importer's chain reaches the package through those same hooks, not through
+ * the fallback table: a launch that never materialized the profile links leaves
+ * the importer with no lookup path of its own.
+ *
+ * @param native - loader-native resolver for this request flavor.
+ * @param request - bare package or package-subpath request.
+ * @param parent - importer whose lookup order applies.
+ * @param attributes - import attributes for the request.
+ * @param packageDir - package directory the fallback route selected.
+ * @returns the importer's resolution when it lands inside `packageDir`, otherwise
+ *   undefined so the caller falls back to the generation's route.
+ */
+function ownPackageResolution(
+  native: EsmResolve, request: string, parent: string, attributes: ImportAttributes, packageDir: string,
+): ResolveResult | undefined {
+  let result: ResolveResult
+  try {
+    result = native(request, parent, attributes) as ResolveResult
+  } catch (_importerMiss) {
+    // The importer reaches this package only through the fallback table.
+    return undefined
+  }
+  return resolutionWithinPackage(result.url, packageDir) ? result : undefined
+}
+
+/** Whether one resolved module URL names a file inside `packageDir`. */
+function resolutionWithinPackage(url: string, packageDir: string): boolean {
+  return url.startsWith('file:') && startsWithin(canonicalPath(fileURLToPath(url)), prefixes(packageDir))
+}
+
 function nativePackageDir(parent: string, name: string): string | undefined {
   for (const searchPath of createRequire(parent).resolve.paths(name) as string[]) {
     const candidate = join(searchPath, name)
@@ -691,7 +733,12 @@ export function installProfileResolution(
         return result
       }
       const routedParent = pathToFileURL(route.kind === 'fallback' ? route.entry.declarer : route.parent).href
-      if (behavior === 'enforce') {
+      // A fallback route selects the package, not the entry inside it, so the
+      // importer's own lookup order stays authoritative for that package.
+      const own = behavior === 'enforce' && route.kind === 'fallback'
+        ? ownPackageResolution(native, request, parent, attributes, route.entry.packageDir)
+        : undefined
+      const resolveFromDeclarer = (): ResolveResult | Promise<ResolveResult> => {
         const previous = delegatedEsm
         delegatedEsm = { parent: routedParent, request }
         const restoreImporter = (error: unknown): never => throwWithImporter(error, routedParent, parent)
@@ -704,11 +751,19 @@ export function installProfileResolution(
           }
           /* v8 ignore next -- Node 24+ resolves synchronously; the Node 22 matrix covers its Promise result */
           if (result instanceof Promise) return result.catch(restoreImporter)
-          if (cacheable) state.esm = result
           return result
         } finally {
           delegatedEsm = previous
         }
+      }
+      if (behavior === 'enforce') {
+        if (own !== undefined) {
+          if (cacheable) state.esm = own
+          return own
+        }
+        const result = resolveFromDeclarer()
+        if (!(result instanceof Promise) && cacheable) state.esm = result
+        return result
       }
       const actual = native(request, parent, attributes)
       const previous = delegatedEsm

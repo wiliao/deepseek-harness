@@ -115,6 +115,7 @@ Loader 结算后，app-boot 在仅 optional 条目未激活时输出警告。如
 - **由 consumer 持有严格语义。** 普通 Loader group 保留成功 sibling。App-boot 在首次结算后应用全局 required-entry policy；agent preset 与动态多 entry 组合在需要 all-or-nothing setup 时，持有并拆卸各自的独立 generation。App-boot 读取 failed fiber 来报告已记录的错误，并在一个进程检查点内合并 Loader 重复的 rejection 通知。
 - **唯一 fallback generation。** 安装优先、有序 bundle 逐根 breadth-first 遍历同时生成运行时表和保留的磁盘 materializer。runtime 模式不创建解析链接，并在旧链接原来的查找位置忽略陈旧投影。package `imports` 选中的外部 bare target 使用相同的选包顺序，映射、conditions 和精确 target 解析仍由 Node 负责。link 模式物化同一张表；dual 模式还会比较 Node 的磁盘结果与表。完整后继 generation 可以原子增加 package name，修改或删除既有映射则要求重启。
 - **应用自有 profile。** link 模式在 profile 内投影缺失的安装包及 bundle 包，不写共享的 Harness-home 后备目录。runtime 模式提供相同的安装包及 bundle generation，不创建链接。包操作仅移除 dsh 所有的 profile 链接；pnpm 管理的条目保持不变。
+- **每个包只有一个入口实例。** fallback 路由选中的是包，而不是包内的入口，因此只要 importer 自身的查找顺序解析到该包目录内的文件，就以它为准；仅当 importer 无法到达该包时，才使用 generation 中相对 declarer 的路由。源码启动会通过当前 loader hook 把工作区包映射到 `src`，而 declarer 的 manifest 会选中已发布的 `lib` 入口；若没有这条规则，这两个入口会作为两个模块实例分别加载，而同一个包若拥有 service definition 或导出的 symbol，两份实例无法互操作。dual 模式仍然比较磁盘结果与 generation，因为它校验的是包身份，而不是入口选择。
 - **自有 Worker。** Worker 构建 banner 会在业务 bundle 前导入 `@deepseek-ai/dsh-app-boot/worker/profile-resolution-bootstrap`。每个 Worker 在自己的 isolate 中安装结构化克隆的 generation。bootstrap bundle 不静态导入任何包。源码 Worker 入口保留自包含依赖，第三方 Worker 不接受注入。
 - **更新完成。** App boot 通过 `internal/update` waterfall 观察重启失败。实时 patch 重载在检查激活状态前等待配置树中的 fiber；单独调用 `Fiber.update()` 或 `Entry.update()` 不能确定重启成功。
 - **单一 rejection 检查点。** `inactiveEntries` 把折入启动诊断的确切原因保持到下一个进程级 rejection 检查点可见，使 `installFailLoud` 能合并 Loader 的重复通知，而所有无关的未处理 rejection 仍然致命。
@@ -153,6 +154,7 @@ Loader 结算后，app-boot 在仅 optional 条目未激活时输出警告。如
 - [dsh-home-paths](../../util/home-paths/README.zh.md)——harness home 解析器（`resolveDshHome`）。
 - [配置来源归属](../../../.agents/notes/implemented/architecture/2026-08-04-configuration-source-ownership.zh.md)——被发现的文件为何不得决定 bootstrap 行为。
 - [Profile 插件组合包](../../../.agents/notes/implemented/architecture/2026-08-05-profile-plugin-bundles.zh.md)——profile 与组合包组合设计。
+- [每个工作区包只有一个模块实例](../../../.agents/notes/implemented/bug-fix/2026-09-21-workspace-package-entry-agreement.zh.md) — 为什么 fallback 路由选中的是包，而不是包内的入口。
 - [用户 patch HMR 测试](../../../.agents/notes/implemented/testing/2026-09-09-user-patch-hmr-test-delivery.zh.md)——实时 patch 行为与原生文件系统投递的验证归属。
 
 -----
