@@ -26,7 +26,7 @@ fallback 路由选中的是**包**，而非包内的入口。当 importer 自身
 
 **用 `createRequire` 比较包目录。** 这会读取 profile 的 `node_modules` fallback 链接，而普通启动从不物化这些链接，因此该检查会在创建链接的 fixture 中通过、在生产中失败。URL containment 比较只依赖产生该分歧的 loader hook。
 
-**改用 `Symbol.for` 共享 scheduler 符号。** 这是止住崩溃最省事的办法，且作为独立加固仍有价值，但它把硬失败变成两个存活的 `ToolRuntime` 实例——两套注册表、两份缓存——因此只处理了症状，而非重复加载的模块。
+**改用 `Symbol.for` 共享 scheduler 符号，而不是修复路由。** 这是止住崩溃最省事的办法，但它把硬失败变成两个存活的 `ToolRuntime` 实例——两套注册表、两份缓存——因此只处理了症状，而非重复加载的模块。它未被用作根治手段，而是后来作为纵深防御单独落地。
 
 **让 generation 同时选择入口与包。** 部署便可以把某个工作区包固定到其构建产物入口，但 generation 在任何插件加载之前就已计算完毕，对当前 loader hook 一无所知；把这种影响编码进去，等于在 Node 实际查询的 resolver 之外又复制了一份解析逻辑。
 
@@ -35,6 +35,8 @@ fallback 路由选中的是**包**，而非包内的入口。当 importer 自身
 源码启动现在为每个工作区包只加载一个实例：`packages/*/lib/` 的加载数从 62 降到 7，剩下的 7 个是生成的 `typert.host.js` 产物，而非 `src` 模块的副本。`pnpm dsh` 无需再依赖构建版启动，污染 session 的失败已从源头消除。
 
 该规则收窄了 fallback 路由的控制范围。generation 仍选择哪个包，而 loader hook 选择包内的哪个入口。若某个部署的 hook 把工作区包映射到该包目录之外的文件，则沿用原有行为，因为要求目录一致；若某个包依赖 generation 为一个 importer 也能到达的包覆盖入口，在 enforce 模式下不再可覆盖。本仓库不存在这样的路由，观察到的所有分歧都是同一个包内的 `src` 与 `lib` 之别。
+
+scheduler 键本身也改为 `Symbol.for('@deepseek-ai/dsh-tools.scheduler')`，作为独立加固：另一个重复的包、worker 或嵌套安装此后会在该键上取得一致，而不是在其上崩溃。它仍只是缓解措施，因为两个存活的 `ToolRuntime` 实例依然意味着两套注册表、两份缓存；根治手段仍是路由规则。`packages/core/tools/tests/scheduler-symbol.spec.ts` 固定了该注册表身份，以及通过它进行的实例查找。
 
 `packages/boot/app-boot/tests/profile-resolution.spec.ts` 用一个注册的 loader hook 覆盖该规则，其中包括 importer 无法到达选中包、必须沿用 generation 路由的情形。该 hook 注册后无法移除，因此独占一个其他用例不会使用的包名。打包可执行文件的运行仍未测量；该规则不可能改变那条路径，因为打包后的二进制没有 source-plane hook，但这一论证是推理，而非证据。
 

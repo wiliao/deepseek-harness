@@ -26,7 +26,7 @@ The router does not detect a source launch. It never inspects process arguments 
 
 **Compare package directories with `createRequire`.** This reads the profile `node_modules` fallback links, which ordinary launches never materialize, so the check would pass in a fixture that creates links and fail in production. The URL-containment comparison depends only on the loader hooks that produce the divergence.
 
-**Share the scheduler symbol through `Symbol.for` instead.** The cheapest way to stop the crash, and it remains useful as independent hardening, but it converts a hard failure into two live `ToolRuntime` instances — two registries and two caches — so it addresses the symptom rather than the duplicated module.
+**Share the scheduler symbol through `Symbol.for` instead of fixing the route.** The cheapest way to stop the crash, but it converts a hard failure into two live `ToolRuntime` instances — two registries and two caches — so it addresses the symptom rather than the duplicated module. It was declined as the cure and later shipped on its own as defense in depth.
 
 **Let the generation select the entry as well as the package.** A deployment could then pin a workspace package to its built entry, but the generation is computed before any plugin loads and knows nothing about the active loader hooks; encoding their effect would duplicate resolution outside the resolver Node consults.
 
@@ -35,6 +35,8 @@ The router does not detect a source launch. It never inspects process arguments 
 A source launch loads one instance of every workspace package: `packages/*/lib/` loads fall from 62 to 7, and the 7 remaining are generated `typert.host.js` artifacts rather than duplicates of a `src` module. `pnpm dsh` works without the built launch, and the failure that poisoned sessions disappears at its source.
 
 The rule narrows what a fallback route controls. The generation still chooses which package, but the loader hooks choose which entry inside it. A deployment whose hooks map a workspace package to a file outside that package's directory keeps the previous behavior, because directory agreement is required; a package that relies on the generation to override the entry for a package the importer can also reach is no longer overridable in enforce mode. No such route exists in this repository, where every observed divergence was `src` versus `lib` within one package.
+
+The scheduler key also moved to `Symbol.for('@deepseek-ai/dsh-tools.scheduler')` as independent hardening: another duplicated package, a worker, or a nested install would now agree on the key instead of crashing on it. It stays a mitigation, because two live `ToolRuntime` instances still mean two registries and two caches; the routing rule remains the cure. `packages/core/tools/tests/scheduler-symbol.spec.ts` pins the registry identity and the instance lookup through it.
 
 `packages/boot/app-boot/tests/profile-resolution.spec.ts` covers the rule with a registered loader hook, including the case where the importer cannot reach the selected package and the generation route must stand. That hook cannot be removed once registered, so it owns a package name no other case uses. A packaged-executable run remains unmeasured; the rule cannot change that path because a packaged binary has no source-plane hook, but that argument is reasoning rather than evidence.
 
