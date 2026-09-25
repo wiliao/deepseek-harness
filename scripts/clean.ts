@@ -122,7 +122,14 @@ export class RepositoryCleaner {
     const outputs = new Set<string>()
     const pending = [join(this.root, 'tsconfig.json')]
     const visited = new Set<string>()
-    const nativeEntryOutput = join(this.root, 'native/system/packages/entry/lib')
+    // Projects whose outDir is the complete build output root rather than a
+    // `types` child: the native package entry emits its runtime bundles into
+    // its own `lib`, and the Desktop keyboard fixture emits declarations into
+    // `lib/desktop-keyboard-test-types` beside nothing else.
+    const selfRootedOutputs = new Set([
+      join(this.root, 'native/system/packages/entry/lib'),
+      join(this.root, 'lib/desktop-keyboard-test-types'),
+    ])
 
     while (pending.length > 0) {
       const nextConfigPath = pending.pop()
@@ -136,7 +143,7 @@ export class RepositoryCleaner {
         const typesDirectory = resolve(parsed.options.outDir)
         const outputDirectory = basename(typesDirectory) === 'types'
           ? dirname(typesDirectory)
-          : typesDirectory === nativeEntryOutput
+          : selfRootedOutputs.has(typesDirectory)
             ? typesDirectory
             : undefined
         if (outputDirectory === undefined) {
